@@ -122,22 +122,52 @@ jobs:
           python -m pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r tjs/scripts/requirements.txt
           python -c "import torch, transformers, optimum, onnxruntime; print('torch', torch.__version__, 'transformers', transformers.__version__, 'onnxruntime', onnxruntime.__version__)"
-      - name: 変換(q8)
+      # ⚠ ここでは量子化しない(fp32 で出す)── 下で proj_out の Transpose を畳んでから量子化する
+      - name: 変換(fp32。onnxslim 込み)
         env:
           OUT: ${{ runner.temp }}/models
         run: |
           set -euo pipefail
           cd tjs
-          python -m scripts.convert --quantize --modes q8 --model_id "openai/whisper-${{ matrix.size }}" --output_parent_dir "$OUT"
+          python -m scripts.convert --model_id "openai/whisper-${{ matrix.size }}" --output_parent_dir "$OUT"
           echo "── 出力 ──"; find "$OUT" -type f -printf '%s\t%p\n' | sort -k2
-      - name: 配る物だけ残す(q8 の onnx と config / tokenizer 一式。fp32 の onnx は捨てる)
+      # 🔴 decoder の proj_out は埋め込みと重みを共有し `MatMul(x, Transpose(weight))` の形で出るので、
+      #    そのままだと q8 が当たらず fp32 106MB が残る(2026-10-03 実測: base の decoder が 158MB)。
+      #    Transpose を定数に畳んでから量子化する(tools/fold_tied_transpose.py)。
+      - name: proj_out の Transpose を定数に畳む(decoder_model_merged)
+        env:
+          OUT: ${{ runner.temp }}/models
+        run: |
+          set -euo pipefail
+          d="$OUT/openai/whisper-${{ matrix.size }}/onnx"
+          python -m pip install numpy onnx >/dev/null
+          python tools/fold_tied_transpose.py "$d/decoder_model_merged.onnx" "$d/decoder_model_merged.onnx"
+          # 配らない物(分かれた decoder 2 本)は量子化の前に捨てる(時間と disk)
+          rm -f "$d/decoder_model.onnx" "$d/decoder_with_past_model.onnx"
+          ls -la "$d"
+      - name: 量子化(q8。transformers.js の scripts.quantize をそのまま使う)
+        env:
+          OUT: ${{ runner.temp }}/models
+        run: |
+          set -euo pipefail
+          d="$OUT/openai/whisper-${{ matrix.size }}/onnx"
+          cd tjs
+          # convert.py が whisper に当てている既定(per_channel / reduce_range = True)と同じ値を明示する
+          python - "$d" <<'PY'
+          import sys
+          from scripts.quantize import quantize, QuantizationArguments
+          d = sys.argv[1]
+          quantize(d, d, QuantizationArguments(modes=['q8'], per_channel=True, reduce_range=True))
+          PY
+          echo "── 量子化後 ──"; find "$d" -type f -printf '%s\t%p\n' | sort -k2
+      - name: 配る物だけ残す(q8 の encoder / merged decoder と config / tokenizer 一式。fp32 は捨てる)
         env:
           OUT: ${{ runner.temp }}/models
         run: |
           set -euo pipefail
           d="$OUT/openai/whisper-${{ matrix.size }}"
           test -d "$d/onnx"
-          find "$d/onnx" -type f ! -name '*_quantized.onnx' -print -delete
+          find "$d/onnx" -type f ! -name 'encoder_model_quantized.onnx' ! -name 'decoder_model_merged_quantized.onnx' -print -delete
           for f in encoder_model_quantized.onnx decoder_model_merged_quantized.onnx; do
             if [ ! -s "$d/onnx/$f" ]; then echo "::error::$d/onnx/$f が無い(または空)── 取る側が引く名前"; exit 1; fi
           done

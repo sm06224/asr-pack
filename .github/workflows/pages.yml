@@ -1,0 +1,242 @@
+# 音声認識の部品一式(asr-pack)を GitHub Pages で配る(PKC3 #772)。
+#
+# 🔴 重みは git に入れない ── Actions の中で上流(openai/whisper-*)から ONNX へ変換し、
+#    成果物から直接 Pages へ配る(git で配る Pages の 1 file 100MB の壁を避ける。
+#    small の decoder は 1 file 157MB)。
+# 🔑 組み立ての正本は PKC3 の `build/asr-pack/` に 1 つだけ。ここへ書き写さない。
+# 🔑 1 job = 1 主張: convert(変換できた)/ assemble(組めて検品を通り配った)/ verify(公開 URL から読めた)。
+name: pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: probe = 157MB のダミーの通過実験だけ / build = 変換して配る
+        type: choice
+        options: [probe, build]
+        default: build
+      pkc3_ref:
+        description: 組み立て script と目録の正本を取る PKC3 の ref
+        default: main
+      transformersjs_ref:
+        description: 変換 script(scripts/convert.py)を取る transformers.js の ref
+        default: '3.7.6'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# ⚠ 同時に 2 つ走らせない(Pages の deploy は 1 本しか通らない)
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  # ── 段 0: 157MB の 1 file が Actions 経由の Pages を通るか ──────────────
+  probe:
+    if: ${{ inputs.mode == 'probe' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      sha256: ${{ steps.mk.outputs.sha256 }}
+      bytes: ${{ steps.mk.outputs.bytes }}
+    steps:
+      - name: ダミー 1 本を組む(乱数 157,000,000 byte。pack.json は置かない ── app が本物と取り違えないため)
+        id: mk
+        run: |
+          set -euo pipefail
+          mkdir -p _site/probe
+          touch _site/.nojekyll
+          head -c 157000000 /dev/urandom > _site/probe/big.bin
+          sha=$(sha256sum _site/probe/big.bin | cut -d' ' -f1)
+          bytes=$(stat -c%s _site/probe/big.bin)
+          echo "$sha" > _site/probe/big.sha256
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "bytes=$bytes" >> "$GITHUB_OUTPUT"
+          echo "big.bin $bytes byte sha256=$sha"
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  verify-probe:
+    if: ${{ inputs.mode == 'probe' }}
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 公開 URL から落として突き合わせる
+        env:
+          URL: https://sm06224.github.io/asr-pack/probe/big.bin
+          WANT_SHA: ${{ needs.probe.outputs.sha256 }}
+          WANT_BYTES: ${{ needs.probe.outputs.bytes }}
+        run: |
+          set -euo pipefail
+          # ⚠ deploy 直後は CDN が追いつかないことがある ── 30 秒おきに最大 10 回
+          for i in $(seq 1 10); do
+            if curl -fsSL -o big.bin "$URL"; then break; fi
+            echo "try $i: まだ読めない"; sleep 30
+          done
+          curl -sI "$URL" | tr -d '\r' | grep -i -E '^(HTTP|content-length|accept-ranges|content-encoding|content-type)' || true
+          got_bytes=$(stat -c%s big.bin)
+          got_sha=$(sha256sum big.bin | cut -d' ' -f1)
+          echo "bytes want=$WANT_BYTES got=$got_bytes"
+          echo "sha256 want=$WANT_SHA got=$got_sha"
+          test "$got_bytes" = "$WANT_BYTES"
+          test "$got_sha" = "$WANT_SHA"
+          echo "✓ 157MB の 1 file が Pages を通った(大きさも sha256 も一致)"
+
+  # ── 段 2: 重みの変換(base / small を別 job で。1 job = 1 主張)────────────
+  convert:
+    if: ${{ inputs.mode == 'build' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        size: [base, small]
+    steps:
+      - name: transformers.js(変換 script)を取る
+        uses: actions/checkout@v4
+        with:
+          repository: huggingface/transformers.js
+          ref: ${{ inputs.transformersjs_ref }}
+          path: tjs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 依存を入れる(torch は CPU 版 ── CUDA 版は disk 14GB を食い切る)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r tjs/scripts/requirements.txt
+          python -c "import torch, transformers, optimum, onnxruntime; print('torch', torch.__version__, 'transformers', transformers.__version__, 'onnxruntime', onnxruntime.__version__)"
+      - name: 変換(q8)
+        env:
+          OUT: ${{ runner.temp }}/models
+        run: |
+          set -euo pipefail
+          cd tjs
+          python -m scripts.convert --quantize --modes q8 --model_id "openai/whisper-${{ matrix.size }}" --output_parent_dir "$OUT"
+          echo "── 出力 ──"; find "$OUT" -type f -printf '%s\t%p\n' | sort -k2
+      - name: 配る物だけ残す(q8 の onnx と config / tokenizer 一式。fp32 の onnx は捨てる)
+        env:
+          OUT: ${{ runner.temp }}/models
+        run: |
+          set -euo pipefail
+          d="$OUT/openai/whisper-${{ matrix.size }}"
+          test -d "$d/onnx"
+          find "$d/onnx" -type f ! -name '*_quantized.onnx' -print -delete
+          for f in encoder_model_quantized.onnx decoder_model_merged_quantized.onnx; do
+            if [ ! -s "$d/onnx/$f" ]; then echo "::error::$d/onnx/$f が無い(または空)── 取る側が引く名前"; exit 1; fi
+          done
+          for f in config.json generation_config.json tokenizer.json tokenizer_config.json preprocessor_config.json; do
+            if [ ! -s "$d/$f" ]; then echo "::error::$d/$f が無い(または空)"; exit 1; fi
+          done
+          echo "── 残した物 ──"; find "$d" -type f -printf '%s\t%p\n' | sort -k2; du -sh "$d"
+          rm -rf ~/.cache/huggingface
+      - uses: actions/upload-artifact@v4
+        with:
+          name: models-${{ matrix.size }}
+          path: ${{ runner.temp }}/models
+          if-no-files-found: error
+          retention-days: 3
+
+  # ── 段 3: PKC3 の script で束ね・ライセンス・目録・検品 → Pages ─────────
+  assemble:
+    if: ${{ inputs.mode == 'build' }}
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # 🔑 組み立ての正本は PKC3 に 1 つだけ(public なので token は要らない)
+      - name: PKC3 の組み立て script を取る
+        uses: actions/checkout@v4
+        with:
+          repository: sm06224/PKC3
+          ref: ${{ inputs.pkc3_ref }}
+          path: pkc3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 依存(asr 用 + PKC3 の root。目録の形は src の正本を vite で読むため)
+        run: |
+          set -euo pipefail
+          (cd pkc3/build/asr-pack && npm ci --ignore-scripts)
+          (cd pkc3 && npm ci --ignore-scripts)
+      - name: runtime を束ねる
+        run: node pkc3/build/asr-pack/bundle-runtime.mjs --out _site
+      - name: ライセンスを集める(上流の全文 + 重みの配布元の宣言)
+        run: node pkc3/build/asr-pack/collect-licenses.mjs --out _site --hf-model openai/whisper-base --hf-model openai/whisper-small
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: models-*
+          path: _site/models
+          merge-multiple: true
+      - name: 目録を書く
+        run: node pkc3/build/asr-pack/make-pack.mjs --out _site
+      # 🔴 配る前に検品する。「出力できた」は「動く」ではない(office-pack で踏んだ)
+      - name: 検品(PKC3 の readAsrPack で読めるか / ライセンスの全文 / 重みの宣言)
+        run: node pkc3/build/asr-pack/check-pack.mjs --out _site --strict-model-license
+      - name: 配る物の一覧
+        run: |
+          set -euo pipefail
+          touch _site/.nojekyll
+          cat _site/pack.json | head -c 2000; echo
+          find _site -type f -printf '%s\t%p\n' | sort -k2
+          du -sh _site
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # ── 配った物を公開 URL から読み直す(目録が指す全 file の大きさと sha256)──
+  verify:
+    if: ${{ inputs.mode == 'build' }}
+    needs: assemble
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: pack.json と全 file を落として突き合わせる
+        env:
+          BASE: https://sm06224.github.io/asr-pack/
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 10); do
+            if curl -fsSL -o pack.json "${BASE}pack.json"; then break; fi
+            echo "try $i: pack.json がまだ読めない"; sleep 30
+          done
+          cat > verify.mjs <<'MJS'
+          import { readFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const base = process.env.BASE;
+          const m = JSON.parse(readFileSync('pack.json', 'utf-8'));
+          const files = [...(m.runtime ?? []), ...Object.values(m.models ?? {}).flat()];
+          if (files.length === 0) { console.log('::error::pack.json に file が 1 つも無い'); process.exit(1); }
+          let fail = 0;
+          for (const f of files) {
+            const r = await fetch(base + f.path);
+            if (!r.ok) { console.log(`::error::${f.path} ${r.status}`); fail = 1; continue; }
+            const buf = Buffer.from(await r.arrayBuffer());
+            const sha = createHash('sha256').update(buf).digest('hex');
+            const ok = buf.length === f.bytes && sha === f.sha256;
+            console.log(`${ok ? '✓' : '✗'} ${f.path} bytes=${buf.length}/${f.bytes} sha=${sha.slice(0, 12)}/${String(f.sha256).slice(0, 12)}`);
+            if (!ok) fail = 1;
+          }
+          console.log(`目録 version=${m.version} files=${files.length}`);
+          process.exit(fail);
+          MJS
+          node verify.mjs

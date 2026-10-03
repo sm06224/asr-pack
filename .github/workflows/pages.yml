@@ -102,6 +102,9 @@ jobs:
       matrix:
         size: [base, small]
     steps:
+      # ⚠ この job は自分の repo も要る(tools/fold_tied_transpose.py)── run 37125622919 は checkout を忘れて
+      #   「No such file」で落ちた(tjs だけ取っていた)
+      - uses: actions/checkout@v4
       - name: transformers.js(変換 script)を取る
         uses: actions/checkout@v4
         with:

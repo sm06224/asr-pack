@@ -111,11 +111,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: 依存を入れる(torch は CPU 版 ── CUDA 版は disk 14GB を食い切る)
+      # ⚠ torch は版を留める(2026-10-03 実測): 最新(2.14)は `torch.onnx.export` が新しい exporter になり
+      #   `onnxscript` を要求して落ちる(`ModuleNotFoundError: No module named 'onnxscript'`)。
+      #   transformers 4.49.0 / optimum(2025-02 の commit)と同じ頃の 2.6.0 は従来の exporter で通る。
+      #   CPU 版にするのは CUDA 版が disk 14GB を食い切るため。
+      - name: 依存を入れる(torch 2.6.0 CPU 版)
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r tjs/scripts/requirements.txt
           python -c "import torch, transformers, optimum, onnxruntime; print('torch', torch.__version__, 'transformers', transformers.__version__, 'onnxruntime', onnxruntime.__version__)"
       - name: 変換(q8)
